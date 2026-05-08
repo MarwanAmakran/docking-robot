@@ -36,7 +36,7 @@ class DockingController(Node):
         self.max_turn         = 0.4
         self.search_turn      = 0.3
         self.undock_speed     = -0.15
-        self.marker_size_dock = 200
+        self.marker_size_dock = 430
         self.undock_duration  = 3.0
 
         # Failsafe instellingen

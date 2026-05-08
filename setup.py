@@ -29,6 +29,7 @@ setup(
 		'docking_controller = docking_robot.docking_controller:main',
 		'serial_bridge = docking_robot.serial_bridge:main',
 		'battery_publisher = docking_robot.battery_publisher:main',
+		'mqtt_bridge = docking_robot.mqtt_bridge:main',
         ],
     },
 )
