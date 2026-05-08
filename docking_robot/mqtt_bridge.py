@@ -12,7 +12,7 @@ except ImportError:
     ROS2_AVAILABLE = False
 
 ROBOT_ID  = os.environ.get("ROBOT_ID", "docking1")
-MQTT_HOST = "10.2.172.134"
+MQTT_HOST = "jetson-dang.local"
 MQTT_PORT = 1883
 
 TOPIC_BATTERY = f"city/robots/{ROBOT_ID}/battery"
