@@ -29,53 +29,40 @@ class DockingController(Node):
             BatteryState, '/battery_state', self.battery_callback, 10)
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
 
-        # Centreer instellingen
-        self.center_threshold    = 20
-        self.align_stable_needed = 8
-        self.align_stable_count  = 0
+        # Instellingen
+        self.center_threshold = 10
+        self.forward_speed    = 0.28
+        self.max_turn         = 0.1
+        self.search_turn      = 0.2
+        self.undock_speed     = -0.15
 
-        # Snelheden — rustiger draaien!
-        self.forward_speed = 0.25
-        self.max_turn      = 0.3   # was 0.5, nu rustiger
-        self.search_turn   = 0.25
-        self.undock_speed  = -0.2
-
-        # Afstand
-        self.marker_real_size     = 100.0
-        self.focal_length         = 600.0
-        self.measured_distance_mm = 0.0
-        self.approach_start_time  = None
-        self.approach_duration    = 0.0
-
-        # Intervals
-        self.align_cmd_time    = 0.0
-        self.align_interval    = 0.5   # stuur commando elke 0.5 sec tijdens align
-        self.approach_cmd_time = 0.0
-        self.approach_interval = 1.0
-        self.search_cmd_time   = 0.0
-        self.search_interval   = 1.0
-        self.log_counter       = 0
+        # Timing
+        self.cmd_interval    = 1.0
+        self.last_cmd_time   = 0.0
+        self.last_turn_time  = 0.0
+        self.wait_after_turn = 1.0
 
         # Failsafes
         self.search_timeout   = 15.0
-        self.approach_timeout = 30.0
-        self.max_lost_marker  = 15
-        self.min_battery      = 9.5
-
-        # State
-        self.state             = IDLE
-        self.undock_start      = None
-        self.search_start      = None
+        self.approach_timeout = 60.0
+        self.max_lost_marker  = 10
         self.lost_marker_count = 0
-        self.running           = True
+        self.min_battery      = 9.5
 
         # Batterij
         self.battery_voltage = 0.0
         self.prev_voltage    = 0.0
         self.charging_status = 'ONBEKEND'
 
+        # State
+        self.state          = IDLE
+        self.search_start   = None
+        self.approach_start = None
+        self.undock_start   = None
+        self.running        = True
+
         self.get_logger().info('=== Docking Controller gestart! ===')
-        self.get_logger().info('D = start docking | U = undock | CTRL+C = stop')
+        self.get_logger().info('D = start | U = undock | CTRL+C = stop')
 
         self.keyboard_thread = threading.Thread(target=self.keyboard_listener)
         self.keyboard_thread.daemon = True
@@ -88,13 +75,18 @@ class DockingController(Node):
             diff = self.battery_voltage - self.prev_voltage
             if diff > 0.05:
                 self.charging_status = 'OPLADEN'
+                if self.state == APPROACH:
+                    self.get_logger().info('Spanning stijgt — DOCKED!')
+                    self.publish_stop()
+                    self.set_state(DOCKED)
             elif diff < -0.05:
                 self.charging_status = 'ONTLADEN'
             else:
                 self.charging_status = 'STABIEL'
+
         if self.battery_voltage > 0.0 and self.battery_voltage < self.min_battery:
             if self.state not in [IDLE, DOCKED]:
-                self.get_logger().error(f'FAILSAFE: Batterij kritiek! {self.battery_voltage:.2f}V')
+                self.get_logger().error('FAILSAFE: Batterij kritiek!')
                 self.publish_stop()
                 self.set_state(IDLE)
 
@@ -111,26 +103,25 @@ class DockingController(Node):
                     break
                 elif key.lower() == 'd':
                     if self.state == IDLE:
-                        self.get_logger().info('D ingedrukt — START DOCKING!')
+                        self.get_logger().info('START DOCKING!')
                         self.set_state(SEARCH)
                     else:
                         self.get_logger().info(f'Al bezig: {self.state}')
                 elif key.lower() == 'u':
                     if self.state == DOCKED:
-                        self.get_logger().info('U ingedrukt — UNDOCK!')
                         self.set_state(UNDOCK)
                     else:
-                        self.get_logger().info(f'Kan niet undocken vanuit {self.state}')
+                        self.get_logger().info('Niet in DOCKED state')
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
     def set_state(self, new_state):
-        self.state               = new_state
-        self.search_start        = None
-        self.approach_start_time = None
-        self.lost_marker_count   = 0
-        self.align_stable_count  = 0
-        self.log_counter         = 0
+        self.state             = new_state
+        self.search_start      = None
+        self.approach_start    = None
+        self.lost_marker_count = 0
+        self.last_cmd_time     = 0.0
+        self.last_turn_time    = 0.0
         self.get_logger().info(f'=== STATE: {new_state} ===')
 
     def publish_stop(self):
@@ -140,34 +131,33 @@ class DockingController(Node):
         except Exception:
             pass
 
-    def send_twist(self, linear, angular):
+    def send_cmd(self, linear, angular):
         twist = Twist()
         twist.linear.x  = float(linear)
         twist.angular.z = float(angular)
         self.cmd_pub.publish(twist)
+        self.last_cmd_time  = time.time()
+        if angular != 0.0:
+            self.last_turn_time = time.time()
 
-    def get_distance_mm(self, corners):
-        c         = corners[0][0]
-        width     = abs(c[1][0] - c[0][0])
-        height    = abs(c[2][1] - c[0][1])
-        marker_px = (width + height) / 2.0
-        if marker_px <= 0:
-            return 9999
-        return (self.marker_real_size * self.focal_length) / marker_px
-
-    def get_direction(self, error):
-        if error < -self.center_threshold:
-            return 'LINKS'
-        elif error > self.center_threshold:
-            return 'RECHTS'
-        else:
-            return 'MIDDEN'
+    def get_aruco_error(self, frame):
+        """Geeft error in pixels terug, of None als geen marker."""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
+        parameters = aruco.DetectorParameters()
+        detector   = aruco.ArucoDetector(aruco_dict, parameters)
+        corners, ids, _ = detector.detectMarkers(gray)
+        if ids is None:
+            return None
+        c  = corners[0][0]
+        cx = int(c[:, 0].mean())
+        return cx - (frame.shape[1] // 2)
 
     def image_callback(self, msg):
         if self.state in [IDLE, DOCKED]:
             return
 
-        self.log_counter += 1
+        frame = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
 
         if self.state == UNDOCK:
             if self.undock_start is None:
@@ -178,42 +168,52 @@ class DockingController(Node):
                 self.set_state(IDLE)
             else:
                 now = time.time()
-                if now - self.approach_cmd_time >= self.approach_interval:
-                    self.send_twist(self.undock_speed, 0.0)
-                    self.approach_cmd_time = now
+                if now - self.last_cmd_time >= self.cmd_interval:
+                    self.send_cmd(self.undock_speed, 0.0)
                     self.get_logger().info('UNDOCK | Achteruit...')
             return
 
         if self.state == APPROACH:
-            if self.approach_start_time is None:
-                self.approach_start_time = time.time()
-            elapsed   = time.time() - self.approach_start_time
-            remaining = self.approach_duration - elapsed
+            if self.approach_start is None:
+                self.approach_start = time.time()
+            elapsed = time.time() - self.approach_start
             if elapsed > self.approach_timeout:
-                self.get_logger().warn('FAILSAFE: Approach timeout — STOP')
+                self.get_logger().warn('FAILSAFE: timeout — STOP')
                 self.publish_stop()
                 self.set_state(IDLE)
                 return
-            if elapsed >= self.approach_duration:
-                self.publish_stop()
-                self.get_logger().info(f'Gereden: {self.measured_distance_mm:.0f}mm — DOCKED!')
-                self.set_state(DOCKED)
+
+            now = time.time()
+            if now - self.last_cmd_time < self.cmd_interval:
+                return
+
+            # Check ArUco tijdens approach
+            error = self.get_aruco_error(frame)
+            if error is not None:
+                if abs(error) > self.center_threshold:
+                    # Afwijking — stuur bij met vooruit + klein draaien
+                    turn = max(min(-float(error) / 200.0, self.max_turn), -self.max_turn)
+                    self.send_cmd(self.forward_speed, turn)
+                    self.get_logger().info(
+                        f'APPROACH | Bijsturen | Error: {error}px | '
+                        f'Bat: {self.battery_voltage:.2f}V')
+                else:
+                    # Gecentreerd — recht vooruit
+                    self.send_cmd(self.forward_speed, 0.0)
+                    self.get_logger().info(
+                        f'APPROACH | Recht vooruit | {elapsed:.0f}sec | '
+                        f'Bat: {self.battery_voltage:.2f}V')
             else:
-                now = time.time()
-                if now - self.approach_cmd_time >= self.approach_interval:
-                    self.send_twist(self.forward_speed, 0.0)
-                    self.approach_cmd_time = now
-                    self.get_logger().info(f'APPROACH | Rechtdoor... nog {remaining:.1f}sec')
+                # Geen marker — recht vooruit
+                self.send_cmd(self.forward_speed, 0.0)
+                self.get_logger().info(
+                    f'APPROACH | {elapsed:.0f}sec | '
+                    f'Bat: {self.battery_voltage:.2f}V | {self.charging_status}')
             return
 
-        # Camera verwerking alleen voor SEARCH en ALIGN
-        frame = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
-        gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
-        parameters = aruco.DetectorParameters()
-        detector   = aruco.ArucoDetector(aruco_dict, parameters)
-        corners, ids, _ = detector.detectMarkers(gray)
-        marker_found = ids is not None
+        # SEARCH en ALIGN
+        error = self.get_aruco_error(frame)
+        marker_found = error is not None
 
         if self.state == SEARCH:
             if self.search_start is None:
@@ -222,62 +222,40 @@ class DockingController(Node):
                 self.set_state(ALIGN)
             else:
                 if time.time() - self.search_start > self.search_timeout:
-                    self.get_logger().warn('FAILSAFE: Marker niet gevonden — IDLE')
+                    self.get_logger().warn('Marker niet gevonden — IDLE')
                     self.publish_stop()
                     self.set_state(IDLE)
                 else:
                     now = time.time()
-                    if now - self.search_cmd_time >= self.search_interval:
-                        self.send_twist(0.0, self.search_turn)
-                        self.search_cmd_time = now
-                        remaining = self.search_timeout - (time.time() - self.search_start)
-                        self.get_logger().info(f'SEARCH | Zoeken... {remaining:.0f}sec')
+                    if now - self.last_cmd_time >= self.cmd_interval:
+                        self.send_cmd(0.0, self.search_turn)
+                        self.get_logger().info('SEARCH | Zoeken...')
 
         elif self.state == ALIGN:
             if not marker_found:
                 self.lost_marker_count += 1
                 if self.lost_marker_count >= self.max_lost_marker:
-                    self.get_logger().warn('FAILSAFE: Marker kwijt — SEARCH')
+                    self.get_logger().warn('Marker kwijt — SEARCH')
                     self.publish_stop()
                     self.set_state(SEARCH)
                 return
 
-            self.lost_marker_count  = 0
-            c          = corners[0][0]
-            cx         = int(c[:, 0].mean())
-            img_center = frame.shape[1] // 2
-            error      = cx - img_center
-            direction  = self.get_direction(error)
-            # Proportioneel maar rustiger
-            turn        = max(min(-float(error) / 200.0, self.max_turn), -self.max_turn)
-            distance_mm = self.get_distance_mm(corners)
-
+            self.lost_marker_count = 0
             now = time.time()
+
+            # Wacht 1 sec na laatste draai
+            if now - self.last_turn_time < self.wait_after_turn:
+                return
+
             if abs(error) <= self.center_threshold:
-                # Gecentreerd — stuur stop en tel frames
-                self.send_twist(0.0, 0.0)
-                self.align_stable_count += 1
-                # Log elke 3 frames
-                if self.log_counter % 3 == 0:
-                    self.get_logger().info(
-                        f'Centreren... {self.align_stable_count}/{self.align_stable_needed} | '
-                        f'Afstand: {distance_mm:.0f}mm')
-                if self.align_stable_count >= self.align_stable_needed:
-                    self.measured_distance_mm = distance_mm
-                    self.approach_duration    = (distance_mm / 1000.0) / self.forward_speed
-                    self.get_logger().info(
-                        f'ALIGN klaar! Afstand: {distance_mm:.0f}mm | '
-                        f'Rijd {self.approach_duration:.1f}sec rechtdoor')
-                    self.set_state(APPROACH)
+                self.get_logger().info(f'GECENTREERD! Error: {error}px — APPROACH!')
+                self.publish_stop()
+                self.set_state(APPROACH)
             else:
-                # Niet gecentreerd — bijsturen met interval
-                self.align_stable_count = 0
-                if now - self.align_cmd_time >= self.align_interval:
-                    self.send_twist(0.0, turn)
-                    self.align_cmd_time = now
-                    self.get_logger().info(
-                        f'ALIGN | {direction} | Error: {error}px | '
-                        f'Afstand: {distance_mm:.0f}mm')
+                if now - self.last_cmd_time >= self.cmd_interval:
+                    turn = max(min(-float(error) / 200.0, self.max_turn), -self.max_turn)
+                    self.send_cmd(0.0, turn)
+                    self.get_logger().info(f'ALIGN | Error: {error}px | Draait...')
 
     def destroy_node(self):
         self.running = False
