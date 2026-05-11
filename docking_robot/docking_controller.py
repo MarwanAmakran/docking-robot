@@ -31,13 +31,13 @@ class DockingController(Node):
 
         # Centreer instellingen
         self.center_threshold    = 20
-        self.align_stable_needed = 10  # 10 frames stabiel = echt gecentreerd
+        self.align_stable_needed = 8
         self.align_stable_count  = 0
 
-        # Snelheden
+        # Snelheden — rustiger draaien!
         self.forward_speed = 0.25
-        self.max_turn      = 0.5
-        self.search_turn   = 0.35
+        self.max_turn      = 0.3   # was 0.5, nu rustiger
+        self.search_turn   = 0.25
         self.undock_speed  = -0.2
 
         # Afstand
@@ -47,16 +47,19 @@ class DockingController(Node):
         self.approach_start_time  = None
         self.approach_duration    = 0.0
 
-        # Intervals — alleen approach heeft interval
+        # Intervals
+        self.align_cmd_time    = 0.0
+        self.align_interval    = 0.5   # stuur commando elke 0.5 sec tijdens align
         self.approach_cmd_time = 0.0
         self.approach_interval = 1.0
         self.search_cmd_time   = 0.0
         self.search_interval   = 1.0
+        self.log_counter       = 0
 
         # Failsafes
-        self.search_timeout   = 10.0
+        self.search_timeout   = 15.0
         self.approach_timeout = 30.0
-        self.max_lost_marker  = 10
+        self.max_lost_marker  = 15
         self.min_battery      = 9.5
 
         # State
@@ -127,6 +130,7 @@ class DockingController(Node):
         self.approach_start_time = None
         self.lost_marker_count   = 0
         self.align_stable_count  = 0
+        self.log_counter         = 0
         self.get_logger().info(f'=== STATE: {new_state} ===')
 
     def publish_stop(self):
@@ -160,11 +164,11 @@ class DockingController(Node):
             return 'MIDDEN'
 
     def image_callback(self, msg):
-        # IDLE en DOCKED — niets doen
         if self.state in [IDLE, DOCKED]:
             return
 
-        # UNDOCK — timer based
+        self.log_counter += 1
+
         if self.state == UNDOCK:
             if self.undock_start is None:
                 self.undock_start = time.time()
@@ -180,7 +184,6 @@ class DockingController(Node):
                     self.get_logger().info('UNDOCK | Achteruit...')
             return
 
-        # APPROACH — geen camera, gewoon tijd rijden
         if self.state == APPROACH:
             if self.approach_start_time is None:
                 self.approach_start_time = time.time()
@@ -203,7 +206,7 @@ class DockingController(Node):
                     self.get_logger().info(f'APPROACH | Rechtdoor... nog {remaining:.1f}sec')
             return
 
-        # SEARCH en ALIGN — camera nodig
+        # Camera verwerking alleen voor SEARCH en ALIGN
         frame = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
         gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
@@ -212,7 +215,6 @@ class DockingController(Node):
         corners, ids, _ = detector.detectMarkers(gray)
         marker_found = ids is not None
 
-        # SEARCH
         if self.state == SEARCH:
             if self.search_start is None:
                 self.search_start = time.time()
@@ -225,13 +227,12 @@ class DockingController(Node):
                     self.set_state(IDLE)
                 else:
                     now = time.time()
-                    remaining = self.search_timeout - (time.time() - self.search_start)
                     if now - self.search_cmd_time >= self.search_interval:
                         self.send_twist(0.0, self.search_turn)
                         self.search_cmd_time = now
+                        remaining = self.search_timeout - (time.time() - self.search_start)
                         self.get_logger().info(f'SEARCH | Zoeken... {remaining:.0f}sec')
 
-        # ALIGN — elke frame bijsturen, geen interval!
         elif self.state == ALIGN:
             if not marker_found:
                 self.lost_marker_count += 1
@@ -247,16 +248,20 @@ class DockingController(Node):
             img_center = frame.shape[1] // 2
             error      = cx - img_center
             direction  = self.get_direction(error)
-            turn       = max(min(-float(error) / 150.0, self.max_turn), -self.max_turn)
+            # Proportioneel maar rustiger
+            turn        = max(min(-float(error) / 200.0, self.max_turn), -self.max_turn)
             distance_mm = self.get_distance_mm(corners)
 
+            now = time.time()
             if abs(error) <= self.center_threshold:
                 # Gecentreerd — stuur stop en tel frames
                 self.send_twist(0.0, 0.0)
                 self.align_stable_count += 1
-                self.get_logger().info(
-                    f'Centreren... {self.align_stable_count}/{self.align_stable_needed} | '
-                    f'Afstand: {distance_mm:.0f}mm')
+                # Log elke 3 frames
+                if self.log_counter % 3 == 0:
+                    self.get_logger().info(
+                        f'Centreren... {self.align_stable_count}/{self.align_stable_needed} | '
+                        f'Afstand: {distance_mm:.0f}mm')
                 if self.align_stable_count >= self.align_stable_needed:
                     self.measured_distance_mm = distance_mm
                     self.approach_duration    = (distance_mm / 1000.0) / self.forward_speed
@@ -265,12 +270,14 @@ class DockingController(Node):
                         f'Rijd {self.approach_duration:.1f}sec rechtdoor')
                     self.set_state(APPROACH)
             else:
-                # Niet gecentreerd — bijsturen elke frame
+                # Niet gecentreerd — bijsturen met interval
                 self.align_stable_count = 0
-                self.send_twist(0.0, turn)
-                self.get_logger().info(
-                    f'ALIGN | {direction} | Error: {error}px | '
-                    f'Afstand: {distance_mm:.0f}mm')
+                if now - self.align_cmd_time >= self.align_interval:
+                    self.send_twist(0.0, turn)
+                    self.align_cmd_time = now
+                    self.get_logger().info(
+                        f'ALIGN | {direction} | Error: {error}px | '
+                        f'Afstand: {distance_mm:.0f}mm')
 
     def destroy_node(self):
         self.running = False
