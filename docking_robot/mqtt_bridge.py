@@ -2,6 +2,7 @@ import json
 import os
 import time
 import paho.mqtt.client as mqtt
+import ssl
 
 try:
     import rclpy
@@ -12,8 +13,10 @@ except ImportError:
     ROS2_AVAILABLE = False
 
 ROBOT_ID  = os.environ.get("ROBOT_ID", "tag22")
-MQTT_HOST = "jetson-dang.local"
-MQTT_PORT = 1883
+MQTT_HOST = "e26688c7fd4c4f238a2e04f8d12199af.s1.eu.hivemq.cloud"
+MQTT_PORT = 8883
+MQTT_USER = "Robot"
+MQTT_PASS = "Password123."
 
 TOPIC_BATTERY = f"city/robots/{ROBOT_ID}/battery"
 TOPIC_DOCKING = f"city/robots/{ROBOT_ID}/docking"
@@ -48,6 +51,10 @@ def detect_charging(voltage, prev):
 def mqtt_connect():
     global _mqtt_client
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+
+    # TLS/SSL voor cloud broker
+    client.tls_set(tls_version=ssl.PROTOCOL_TLS)
+    client.username_pw_set(MQTT_USER, MQTT_PASS)
 
     def on_connect(c, ud, flags, rc, props=None):
         if rc == 0:
