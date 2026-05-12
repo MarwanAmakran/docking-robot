@@ -34,13 +34,19 @@ class DockingController(Node):
         self.forward_speed    = 0.28
         self.max_turn         = 0.1
         self.search_turn      = 0.2
-        self.undock_speed     = -0.15
+        self.undock_speed     = -0.3   # sneller achteruit
+
+        # Undock hardcoded
+        self.undock_start     = None
+        self.undock_phase     = 0
+        self.undock_back_time = 20.0   # 20 sec achteruit = minstens 20cm
+        self.undock_turn_time = 16.0   # 16 sec draaien = 180 graden
 
         # Timing
         self.cmd_interval    = 1.0
         self.last_cmd_time   = 0.0
         self.last_turn_time  = 0.0
-        self.wait_after_turn = 1.0
+        self.wait_after_turn = 1.5    # iets langer wachten na draai
 
         # Failsafes
         self.search_timeout   = 15.0
@@ -58,11 +64,10 @@ class DockingController(Node):
         self.state          = IDLE
         self.search_start   = None
         self.approach_start = None
-        self.undock_start   = None
         self.running        = True
 
         self.get_logger().info('=== Docking Controller gestart! ===')
-        self.get_logger().info('D = start | U = undock | CTRL+C = stop')
+        self.get_logger().info('D = start | U = undock (altijd) | CTRL+C = stop')
 
         self.keyboard_thread = threading.Thread(target=self.keyboard_listener)
         self.keyboard_thread.daemon = True
@@ -108,10 +113,10 @@ class DockingController(Node):
                     else:
                         self.get_logger().info(f'Al bezig: {self.state}')
                 elif key.lower() == 'u':
-                    if self.state == DOCKED:
-                        self.set_state(UNDOCK)
-                    else:
-                        self.get_logger().info('Niet in DOCKED state')
+                    # Altijd undocken mogelijk!
+                    self.get_logger().info(f'UNDOCK gestart vanuit {self.state}!')
+                    self.publish_stop()
+                    self.set_state(UNDOCK)
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
@@ -122,6 +127,8 @@ class DockingController(Node):
         self.lost_marker_count = 0
         self.last_cmd_time     = 0.0
         self.last_turn_time    = 0.0
+        self.undock_start      = None
+        self.undock_phase      = 0
         self.get_logger().info(f'=== STATE: {new_state} ===')
 
     def publish_stop(self):
@@ -136,12 +143,11 @@ class DockingController(Node):
         twist.linear.x  = float(linear)
         twist.angular.z = float(angular)
         self.cmd_pub.publish(twist)
-        self.last_cmd_time  = time.time()
+        self.last_cmd_time = time.time()
         if angular != 0.0:
             self.last_turn_time = time.time()
 
     def get_aruco_error(self, frame):
-        """Geeft error in pixels terug, of None als geen marker."""
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
         parameters = aruco.DetectorParameters()
@@ -159,20 +165,38 @@ class DockingController(Node):
 
         frame = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
 
+        # UNDOCK — 20sec achteruit dan 180 graden draaien
         if self.state == UNDOCK:
             if self.undock_start is None:
                 self.undock_start = time.time()
-            if time.time() - self.undock_start >= 3.0:
-                self.publish_stop()
-                self.undock_start = None
-                self.set_state(IDLE)
-            else:
-                now = time.time()
-                if now - self.last_cmd_time >= self.cmd_interval:
-                    self.send_cmd(self.undock_speed, 0.0)
-                    self.get_logger().info('UNDOCK | Achteruit...')
+            elapsed = time.time() - self.undock_start
+            now     = time.time()
+
+            if self.undock_phase == 0:
+                if elapsed >= self.undock_back_time:
+                    self.publish_stop()
+                    self.undock_phase = 1
+                    self.undock_start = time.time()
+                    self.get_logger().info('Achteruit klaar — nu 180 graden draaien!')
+                else:
+                    if now - self.last_cmd_time >= self.cmd_interval:
+                        self.send_cmd(self.undock_speed, 0.0)
+                        self.get_logger().info(
+                            f'UNDOCK | Achteruit... {elapsed:.0f}/{self.undock_back_time:.0f}sec')
+
+            elif self.undock_phase == 1:
+                if elapsed >= self.undock_turn_time:
+                    self.publish_stop()
+                    self.get_logger().info('180 graden klaar — IDLE!')
+                    self.set_state(IDLE)
+                else:
+                    if now - self.last_cmd_time >= self.cmd_interval:
+                        self.send_cmd(0.0, 0.8)
+                        self.get_logger().info(
+                            f'UNDOCK | Draaien... {elapsed:.0f}/{self.undock_turn_time:.0f}sec')
             return
 
+        # APPROACH
         if self.state == APPROACH:
             if self.approach_start is None:
                 self.approach_start = time.time()
@@ -183,36 +207,25 @@ class DockingController(Node):
                 self.set_state(IDLE)
                 return
 
-            now = time.time()
-            if now - self.last_cmd_time < self.cmd_interval:
-                return
-
-            # Check ArUco tijdens approach
+            now   = time.time()
             error = self.get_aruco_error(frame)
-            if error is not None:
-                if abs(error) > self.center_threshold:
-                    # Afwijking — stuur bij met vooruit + klein draaien
+
+            if now - self.last_cmd_time >= self.cmd_interval:
+                if error is not None and abs(error) > self.center_threshold:
                     turn = max(min(-float(error) / 200.0, self.max_turn), -self.max_turn)
                     self.send_cmd(self.forward_speed, turn)
                     self.get_logger().info(
                         f'APPROACH | Bijsturen | Error: {error}px | '
                         f'Bat: {self.battery_voltage:.2f}V')
                 else:
-                    # Gecentreerd — recht vooruit
                     self.send_cmd(self.forward_speed, 0.0)
                     self.get_logger().info(
                         f'APPROACH | Recht vooruit | {elapsed:.0f}sec | '
-                        f'Bat: {self.battery_voltage:.2f}V')
-            else:
-                # Geen marker — recht vooruit
-                self.send_cmd(self.forward_speed, 0.0)
-                self.get_logger().info(
-                    f'APPROACH | {elapsed:.0f}sec | '
-                    f'Bat: {self.battery_voltage:.2f}V | {self.charging_status}')
+                        f'Bat: {self.battery_voltage:.2f}V | {self.charging_status}')
             return
 
         # SEARCH en ALIGN
-        error = self.get_aruco_error(frame)
+        error        = self.get_aruco_error(frame)
         marker_found = error is not None
 
         if self.state == SEARCH:
@@ -243,7 +256,7 @@ class DockingController(Node):
             self.lost_marker_count = 0
             now = time.time()
 
-            # Wacht 1 sec na laatste draai
+            # Wacht 1.5 sec na laatste draai
             if now - self.last_turn_time < self.wait_after_turn:
                 return
 
