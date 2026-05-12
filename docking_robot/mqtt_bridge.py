@@ -11,7 +11,7 @@ try:
 except ImportError:
     ROS2_AVAILABLE = False
 
-ROBOT_ID  = os.environ.get("ROBOT_ID", "tag2")
+ROBOT_ID  = os.environ.get("ROBOT_ID", "tag22")
 MQTT_HOST = "jetson-dang.local"
 MQTT_PORT = 1883
 
